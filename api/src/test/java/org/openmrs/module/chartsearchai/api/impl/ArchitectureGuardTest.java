@@ -1264,115 +1264,106 @@ public class ArchitectureGuardTest {
 	}
 
 	/**
-	 * Body readers that reach the whole response without passing a ceiling, and the wildcard
-	 * imports that would let one be written without its class name. A SET because the gap is
-	 * always what nobody thought of: the first version named {@code BodyHandlers.ofString} alone
-	 * and {@code ofByteArray} passed it; the second was defeated by {@code BodySubscribers.ofString}
-	 * in a lambda handler and by a wildcard static import, both measured buffering a whole 5 MB
-	 * body with this rule green.
+	 * Issue #627: every read of an operator-configured remote response body goes through one
+	 * class, and the question is asked of the COMPILED classes — which class files' constant
+	 * pools bind {@code HttpResponse.body()} — instead of the source text. A read reached
+	 * through a renamed reference, a helper in another file, or a same-named method is still
+	 * the same pool entries, and that is the half the source-text rule this replaces could
+	 * not ask: four defeats, measured against it, all four silent.
 	 *
-	 * <p>Declared BEFORE the rule's own javadoc deliberately. Inserted after it, a second doc
-	 * comment takes that javadoc for itself and leaves the rule undocumented — which is what
-	 * happened here once, silently, through a compile and a green suite.</p>
-	 */
-	private static final List<String> BUFFERING_BODY_READERS = java.util.Arrays.asList(
-			"BodyHandlers.ofString", "BodyHandlers.ofByteArray", "BodyHandlers.ofFile",
-			"BodyHandlers.ofByteArrayConsumer", "BodyHandlers.ofLines",
-			"BodySubscribers.ofString", "BodySubscribers.ofByteArray", "BodySubscribers.ofLines",
-			"BodyHandlers.*", "BodySubscribers.*");
-
-	/**
-	 * Issue #446: the endpoint {@code chartsearchai.llm.remote.endpointUrl} names is an untrusted
-	 * network peer, so no read of its response body may reach the whole of it without passing a
-	 * ceiling. This asks the NAME question only — does a production source spell a reader that
-	 * buffers the lot — over the file's code with comments stripped and whitespace removed,
-	 * because per line a wrapped {@code BodyHandlers\n.ofString(} was measured passing silently.
+	 * <p>A holder is a class file whose pool BINDS the call: an {@code InterfaceMethodref}
+	 * entry naming {@code HttpResponse.body()}. Loose strings cannot ask it —
+	 * {@code body()} erases to {@code ()Ljava/lang/Object;}, so the descriptor shares
+	 * nothing with any body shape, and a first cut matching owner-plus-name-plus-descriptor
+	 * as strings matched correlated neighbours instead (present before and after the
+	 * refactor — the red/green transition below caught it). Only the reader and the exempt
+	 * engine may hold the binding; anything else is a read on a path this rule exists to
+	 * catch before any test drives it.</p>
 	 *
-	 * <p><b>It also asks that each {@code response.body()} sit behind a named bounded reader, and
-	 * that half is DEFENCE IN DEPTH rather than the answer.</b> As the answer it failed: a rule
-	 * matching the reader's name in front of the call was defeated six ways. Reading the file
-	 * dense and walking the whole tree closed two of them, measured — a wrapped read and a
-	 * helper in another file both redden now. The other four do not close: a renamed reference,
-	 * the exempt file hosting the read, a same-named production method
-	 * ({@code LlmResponseParser.parseStreamingResponse} satisfies "preceded by
-	 * {@code parseStreamingResponse(}" while removing the ceiling), and a ceiling left in place
-	 * with its limit set to {@code Long.MAX_VALUE}, which no text match of any kind can see.
-	 * {@link RemoteLlmEngineResponseSizeBoundTest} catches every one of those, by driving each
-	 * entry point against a real hostile peer — measured, one at a time. What it cannot catch is
-	 * a read on a path it does not drive, and that is the one thing this half adds: a NEW read
-	 * site, spelled plainly, before any test exists for it. Read it as "a new read must sit
-	 * behind a named reader", never as an answer to where the bytes actually go.</p>
+	 * <p><b>Residue, and its direction.</b> An entry the bytecode never invokes would still
+	 * count — javac emits none, and the direction is a named failure rather than a silent
+	 * pass. A call through a concrete-typed receiver would carry a different owner, but the
+	 * type is an interface and its implementations live in {@code jdk.internal}, so that
+	 * spelling is unwritable. What this case cannot see is a read that never spells
+	 * {@code body()} at all — a body reached through reflection or a smuggled stream — and
+	 * that half stays with {@code RemoteLlmEngineResponseSizeBoundTest}, on every path that
+	 * suite drives.</p>
 	 *
-	 * <p><b>Residue.</b> A buffering reader spelled in a way this list does not carry passes,
-	 * and so does a new read reached through a reference named anything but {@code response};
-	 * the behavioural suite is what catches those, on every path that suite drives. A new read
-	 * that is BOTH differently named AND on a path nobody drives is covered by neither. The
-	 * scan is keyed on the simple file name, so two production classes sharing one would leave
-	 * a file unread — there are none today — and it
-	 * walks {@code api} only, which is where every HTTP client in this module lives.</p>
+	 * <p>The buffering-factory half rides in the same walk: no production pool outside the
+	 * exempt engine may bind a whole-body factory. Bytecode sees through imports, so the
+	 * wildcard entries the old list needed retire with it.</p>
+	 *
+	 * <p>Canaries, each failing on empty discovery: the walked set is non-empty and holds
+	 * {@code RemoteLlmEngine} (the right tree, adopted from the old rule); the reader holds
+	 * a {@code body()} binding; the exempt engine holds one (a stale exemption fails here
+	 * instead of widening silently); the exempt engine holds a buffering-factory binding
+	 * (the ban half can see what it forbids).</p>
 	 */
 	@Test
-	public void noProductionSourceBuffersAWholeRemoteResponse() throws IOException {
-		// Scoped to PRODUCTION sources by its own walk: getSourceCache() covers src/test too,
-		// where LlmEndpointTestSupport legitimately reads a body it asked a live endpoint for.
-		Path main = SRC_ROOT.resolve("src/main/java");
-		assertTrue(Files.exists(main),
-				"precondition: no production source tree under " + SRC_ROOT + ", so this rule "
-						+ "would scan nothing and report no violations — it fails instead");
-
-		// Closing a body unread reads nothing, so `response.body().close()` passes (#620); chartsearchai#627
-		// proposes enforcing the ceiling structurally instead of by this text match.
-		Pattern unbounded = Pattern.compile("(?<!readBoundedBody\\()(?<!readTruncatedErrorBody\\()"
-				+ "(?<!parseStreamingResponse\\()(?<!newBoundedResponseStream\\()response\\.body\\(\\)(?!\\.close\\(\\);)");
+	public void remoteResponseBodyReadsGoThroughOneClass() throws IOException {
+		Path classes = apiClassesDirectory();
+		List<String> walked = new ArrayList<>();
+		List<String> bodyHolders = new ArrayList<>();
+		List<String> bufferingHolders = new ArrayList<>();
+		List<String> bufferingNames = java.util.Arrays.asList(
+				"ofString", "ofByteArray", "ofFile", "ofByteArrayConsumer", "ofLines");
+		try (java.util.stream.Stream<Path> tree = Files.walk(classes)) {
+			for (Path file : tree.filter(f -> f.toString().endsWith(".class"))
+					.collect(java.util.stream.Collectors.toList())) {
+				String simple = file.getFileName().toString();
+				walked.add(simple);
+				for (String ref : poolMethodRefs(file)) {
+					if ("11:java/net/http/HttpResponse#body".equals(ref)
+							&& !bodyHolders.contains(simple)) {
+						bodyHolders.add(simple);
+					}
+					int hash = ref.indexOf('#');
+					String owner = ref.substring(3, hash);
+					String name = ref.substring(hash + 1);
+					if (ref.startsWith("10:")
+							&& ("java/net/http/HttpResponse$BodyHandlers".equals(owner)
+									|| "java/net/http/HttpResponse$BodySubscribers".equals(owner))
+							&& bufferingNames.contains(name)
+							&& !bufferingHolders.contains(simple)) {
+						bufferingHolders.add(simple);
+					}
+				}
+			}
+		}
+		assertTrue(!walked.isEmpty(),
+				"precondition: walked no class files under " + classes + ", so this rule "
+						+ "would forbid nothing — it fails instead");
+		assertTrue(walked.contains("RemoteLlmEngine.class"),
+				"precondition: RemoteLlmEngine.class was not among the " + walked.size()
+						+ " class files walked, so this rule is looking at the wrong tree");
+		assertTrue(bodyHolders.contains("RemoteResponseBodies.class"),
+				"precondition: the reader holds no HttpResponse.body() binding "
+						+ "(holders seen: " + bodyHolders + "), so either the refactor "
+						+ "is not in place or this rule cannot see it");
+		assertTrue(bodyHolders.contains("LocalLlmEngine.class"),
+				"precondition: the exempt engine holds no body() binding (holders seen: "
+						+ bodyHolders + ") — if it genuinely stopped reading bodies, drop "
+						+ "its exemption below instead of widening it silently");
+		assertTrue(bufferingHolders.contains("LocalLlmEngine.class"),
+				"precondition: the exempt engine holds no buffering-factory binding "
+						+ "(holders seen: " + bufferingHolders + "), so the ban half "
+						+ "cannot see what it forbids");
 		List<String> violations = new ArrayList<>();
-		List<String> scanned = new ArrayList<>();
-		java.util.Map<String, String> dense = new java.util.LinkedHashMap<>();
-		Files.walkFileTree(main, new SimpleFileVisitor<Path>() {
-			@Override
-			public FileVisitResult visitFile(Path file, BasicFileAttributes attrs)
-					throws IOException {
-				if (file.toString().endsWith(".java")) {
-					// Read HERE rather than fetched back out of getSourceCache(), which is keyed
-					// on the simple name over src/test as well: this rule is about production,
-					// and a cache hit is not a promise about which tree it came from. Comments
-					// are stripped by the shared codeLines() — hand-rolled here, this rule was
-					// measured reddening on an ordinary trailing comment that named a reader.
-					scanned.add(file.getFileName().toString());
-					dense.put(file.getFileName().toString(),
-							String.join("", codeLines(Files.readAllLines(file,
-									StandardCharsets.UTF_8))).replaceAll("\\s+", ""));
-				}
-				return FileVisitResult.CONTINUE;
+		for (String holder : bodyHolders) {
+			if (!"RemoteResponseBodies.class".equals(holder)
+					&& !"LocalLlmEngine.class".equals(holder)) {
+				violations.add(holder + " — a remote response body must be read through "
+						+ "RemoteResponseBodies (issue #627). If this peer is NOT an "
+						+ "operator-configurable address, exempt the class in this rule "
+						+ "and say why, as LocalLlmEngine is.");
 			}
-		});
-		// The right-tree canary. Existence of the directory is NOT equivalent: the sibling omod
-		// module carries the same package path, so a root pointed there passes the check above
-		// and this rule then scans a tree with no engine in it and reports nothing.
-		assertTrue(scanned.contains("RemoteLlmEngine.java"),
-				"precondition: RemoteLlmEngine.java was not among the " + scanned.size()
-						+ " production sources walked, so this rule is looking at the wrong tree");
-
-		for (java.util.Map.Entry<String, String> source : dense.entrySet()) {
-			if ("LocalLlmEngine.java".equals(source.getKey())) {
-				// Exempt deliberately: its peer is this module's own subprocess at a hardcoded
-				// 127.0.0.1, never an address an operator supplies, so #446's threat does not
-				// reach it. Named here so the exclusion is reviewable rather than merely absent.
-				continue;
-			}
-			if (unbounded.matcher(source.getValue()).find()) {
-				violations.add(source.getKey() + " — a remote response body must be read through "
-						+ "readBoundedBody, parseStreamingResponse, readTruncatedErrorBody or BoundedResponseStream "
-						+ "(issue #446). If this peer is NOT an operator-configurable address, "
-						+ "exempt the file in this rule and say why, as LocalLlmEngine.java is.");
-			}
-			for (String buffering : BUFFERING_BODY_READERS) {
-				if (source.getValue().contains(buffering)) {
-					violations.add(source.getKey() + " — " + buffering + " reaches the whole "
-							+ "response body without passing the ceiling. Read an InputStream "
-							+ "under one instead (issue #446); if this peer is NOT an "
-							+ "operator-configurable address, exempt the file in this rule and "
-							+ "say why, as LocalLlmEngine.java is.");
-				}
+		}
+		for (String holder : bufferingHolders) {
+			if (!"LocalLlmEngine.class".equals(holder)) {
+				violations.add(holder + " — binds a whole-body factory without passing a "
+						+ "ceiling (issue #627). If this peer is NOT an "
+						+ "operator-configurable address, exempt the class in this rule "
+						+ "and say why, as LocalLlmEngine is.");
 			}
 		}
 		assertNoViolations(violations);
@@ -2406,6 +2397,75 @@ public class ArchitectureGuardTest {
 			}
 		}
 		return slots;
+	}
+
+	/**
+	 * Every method reference in the pool as {@code tag:owner#name}, for {@code Methodref}
+	 * (tag 10) and {@code InterfaceMethodref} (tag 11) entries alike — resolved through the
+	 * entry's own class and name indexes rather than matched as loose strings, because a
+	 * body read reached through a renamed reference is still this triple while a class that
+	 * merely mentions the three parts in unrelated places is not. Long and Double entries
+	 * consume the slot after them, as in {@link #readConstantPool}.
+	 */
+	private static List<String> poolMethodRefs(Path classFile) throws IOException {
+		java.nio.ByteBuffer in = java.nio.ByteBuffer.wrap(
+				java.nio.file.Files.readAllBytes(classFile));
+		in.position(8);
+		int count = in.getShort() & 0xFFFF;
+		String[] utf8 = new String[count];
+		int[] className = new int[count];
+		int[] natName = new int[count];
+		int[] refClass = new int[count];
+		int[] refNat = new int[count];
+		int[] refTag = new int[count];
+		java.util.Arrays.fill(refTag, -1);
+		for (int slot = 1; slot < count; slot++) {
+			int tag = in.get() & 0xFF;
+			switch (tag) {
+				case 1: {
+					byte[] bytes = new byte[in.getShort() & 0xFFFF];
+					in.get(bytes);
+					utf8[slot] = new String(bytes, java.nio.charset.StandardCharsets.UTF_8);
+					break;
+				}
+				case 7:
+					className[slot] = in.getShort() & 0xFFFF;
+					break;
+				case 12:
+					natName[slot] = in.getShort() & 0xFFFF;
+					in.getShort();
+					break;
+				case 10: case 11:
+					refClass[slot] = in.getShort() & 0xFFFF;
+					refNat[slot] = in.getShort() & 0xFFFF;
+					refTag[slot] = tag;
+					break;
+				case 8: case 16:
+					in.position(in.position() + 2);
+					break;
+				case 15:
+					in.position(in.position() + 3);
+					break;
+				case 5: case 6:
+					in.position(in.position() + 8);
+					slot++;
+					break;
+				default:
+					in.position(in.position() + 4);
+					break;
+			}
+		}
+		List<String> refs = new ArrayList<>();
+		for (int slot = 1; slot < count; slot++) {
+			if (refTag[slot] == 10 || refTag[slot] == 11) {
+				String owner = utf8[className[refClass[slot]]];
+				String name = utf8[natName[refNat[slot]]];
+				if (owner != null && name != null) {
+					refs.add(refTag[slot] + ":" + owner + "#" + name);
+				}
+			}
+		}
+		return refs;
 	}
 
 	// --- Infrastructure ---

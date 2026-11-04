@@ -87,7 +87,7 @@ public class HubProfileService {
 			HttpResponse<InputStream> response = httpClient.send(
 					request.build(), HttpResponse.BodyHandlers.ofInputStream());
 			Map<String, Object> payload;
-			try (InputStream body = new BoundedResponseStream(response.body(), RemoteLlmEngine.MAX_RESPONSE_BYTES)) {
+			try (InputStream body = RemoteResponseBodies.streamingBody(response)) {
 				if (response.statusCode() < 200 || response.statusCode() >= 300) {
 					throw new APIException("Hub profile discovery failed: HTTP " + response.statusCode());
 				}

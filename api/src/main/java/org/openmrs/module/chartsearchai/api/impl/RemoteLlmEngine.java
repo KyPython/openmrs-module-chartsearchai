@@ -153,12 +153,12 @@ public class RemoteLlmEngine implements LlmEngine {
 					HttpResponse.BodyHandlers.ofInputStream());
 
 			if (response.statusCode() < 200 || response.statusCode() >= 300) {
-				String body = readTruncatedErrorBody(response.body());
+				String body = RemoteResponseBodies.readTruncatedError(response);
 				logErrorBody(response.statusCode(), body);
 				throwForErrorResponse(response.statusCode(), body);
 			}
 
-			return parseResponse(readBoundedBody(response.body()));
+			return parseResponse(RemoteResponseBodies.readBounded(response));
 		}
 		catch (BoundedResponseStream.ResponseTooLargeException e) {
 			throw oversized(e);
@@ -204,12 +204,14 @@ public class RemoteLlmEngine implements LlmEngine {
 					HttpResponse.BodyHandlers.ofInputStream());
 
 			if (response.statusCode() < 200 || response.statusCode() >= 300) {
-				String body = readTruncatedErrorBody(response.body());
+				String body = RemoteResponseBodies.readTruncatedError(response);
 				logErrorBody(response.statusCode(), body);
 				throwForErrorResponse(response.statusCode(), body);
 			}
 
-			return parseStreamingResponse(response.body(), tokenConsumer, cancellation);
+			// Already ceilinged by streamingBody; the overload wraps again defensively for its
+			// direct unit-test callers — same limit, same throw either way.
+			return parseStreamingResponse(RemoteResponseBodies.streamingBody(response), tokenConsumer, cancellation);
 		}
 		catch (BoundedResponseStream.ResponseTooLargeException e) {
 			throw oversized(e);
@@ -232,7 +234,7 @@ public class RemoteLlmEngine implements LlmEngine {
 			// is all readiness needs, and the request timeout bounds only the headers, so a peer that answers
 			// and holds its body open cannot stall provider discovery.
 			HttpResponse<InputStream> response = getHttpClient().send(request, HttpResponse.BodyHandlers.ofInputStream());
-			response.body().close();
+			RemoteResponseBodies.closeWithoutReading(response);
 			return response.statusCode() < 500;
 		}
 		catch (IOException | IllegalArgumentException e) {
@@ -355,54 +357,23 @@ public class RemoteLlmEngine implements LlmEngine {
 	}
 
 	/**
-	 * The one place {@link #MAX_RESPONSE_BYTES} is applied. Both reads that may ABORT go through
-	 * it — {@link #parseStreamingResponse} and {@link #readBoundedBody}. It is not every read of
-	 * a response body: {@link #readTruncatedErrorBody} reads a non-2xx body under its own,
+	 * Pairs a stream with the {@link #MAX_RESPONSE_BYTES} ceiling. One of the two places the
+	 * ceiling is applied: this one serves the {@code InputStream}-taking parse path (and its
+	 * direct unit-test callers); {@link RemoteResponseBodies} pairs extraction with the same
+	 * ceiling for response-taking callers. It is not every read of a response body:
+	 * {@link RemoteResponseBodies#readTruncatedError} reads a non-2xx body under its own,
 	 * tighter ceiling and never through this.
 	 *
-	 * <p><b>Nothing structural stops a future caller going round it</b>, and a review measured
-	 * two ways: {@code LlmResponseParser.parseStreamingResponse} is a real method of the same
-	 * bare name that does not wrap, and a ceiling left in place with an unusable limit looks
-	 * identical to any source check. What catches both is
-	 * {@code RemoteLlmEngineResponseSizeBoundTest}, which drives every entry point against a
-	 * real hostile peer; {@code ArchitectureGuardTest.noProductionSourceBuffersAWholeRemoteResponse}
-	 * covers only the spelling half.</p>
+	 * <p><b>What is structural now, and what is not.</b> Extraction moved: no production
+	 * caller outside {@link RemoteResponseBodies} invokes {@code HttpResponse.body()}, and
+	 * {@code ArchitectureGuardTest.remoteResponseBodyReadsGoThroughOneClass} asks that of
+	 * the compiled classes. What no structural rule can see is a ceiling left in place with
+	 * an unusable limit — the value travels in a field, not a literal — and that half stays
+	 * with {@code RemoteLlmEngineResponseSizeBoundTest}, which drives every entry point
+	 * against a real hostile peer.</p>
 	 */
 	private static BoundedResponseStream bounded(InputStream body) {
 		return new BoundedResponseStream(body, MAX_RESPONSE_BYTES);
-	}
-
-	/**
-	 * The whole body as text, or {@link BoundedResponseStream.ResponseTooLargeException} if the peer
-	 * sent more than {@link #MAX_RESPONSE_BYTES}. Aborts rather than truncating, unlike
-	 * {@link #readTruncatedErrorBody}: half a completion envelope is not a completion, and a caller
-	 * handed one would report a parse failure for what is really an oversized response.
-	 */
-	String readBoundedBody(InputStream body) throws IOException {
-		try (InputStream ceilinged = bounded(body)) {
-			return new String(ceilinged.readAllBytes(), StandardCharsets.UTF_8);
-		}
-	}
-
-	/**
-	 * At most {@link #MAX_ERROR_BODY_BYTES} of a non-2xx body, abandoning the rest unread —
-	 * truncating rather than raising, for the reason that constant states. The cut is at a byte
-	 * and not a character boundary, which costs at worst one replacement character: the result
-	 * only ever reaches a log line, never a parser.
-	 */
-	private static String readTruncatedErrorBody(InputStream body) {
-		try (InputStream in = body) {
-			// The three-arg form fills a buffer this method sizes. The one-arg readNBytes(int)
-			// would allocate its own and then copy out whatever the body actually was, which for
-			// a short error body — the common case — is a second allocation for nothing.
-			byte[] buffer = new byte[MAX_ERROR_BODY_BYTES];
-			return new String(buffer, 0, in.readNBytes(buffer, 0, buffer.length),
-					StandardCharsets.UTF_8);
-		}
-		catch (IOException e) {
-			log.debug("Could not read the error body from the remote LLM API", e);
-			return "";
-		}
 	}
 
 	/**

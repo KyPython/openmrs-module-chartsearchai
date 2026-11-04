@@ -35,8 +35,8 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import org.openmrs.api.context.Context;
 import org.openmrs.module.chartsearchai.ChartSearchAiConstants;
 import org.openmrs.module.chartsearchai.api.conversation.PriorClinicalTurn;
-import org.openmrs.module.chartsearchai.api.impl.BoundedResponseStream;
 import org.openmrs.module.chartsearchai.api.impl.RemoteLlmEngine;
+import org.openmrs.module.chartsearchai.api.impl.RemoteResponseBodies;
 import org.springframework.stereotype.Component;
 
 /**
@@ -83,7 +83,7 @@ public class HttpHubStreamTransport implements HubStreamTransport {
 				builder.header("Authorization", "Bearer " + key.trim());
 			}
 			HttpResponse<InputStream> response = awaitHeaders(builder.build(), cancellation);
-			try (InputStream bodyStream = new BoundedResponseStream(response.body(), RemoteLlmEngine.MAX_RESPONSE_BYTES)) {
+			try (InputStream bodyStream = RemoteResponseBodies.streamingBody(response)) {
 				cancellation.bindCloseable(bodyStream);
 				try {
 					if (response.statusCode() < 200 || response.statusCode() >= 300) {
